@@ -1,6 +1,11 @@
+// Copyright 2018 The mkcert Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package main
 
 import (
+	"bytes"
 	"log"
 	"os"
 	"os/exec"
@@ -13,34 +18,53 @@ var (
 	hasNSS       bool
 	hasCertutil  bool
 	certutilPath string
-	nssDB        = filepath.Join(os.Getenv("HOME"), ".pki/nssdb")
+	nssDBs       = []string{
+		filepath.Join(os.Getenv("HOME"), ".pki/nssdb"),
+		filepath.Join(os.Getenv("HOME"), "snap/chromium/current/.pki/nssdb"), // Snapcraft
+		"/etc/pki/nssdb", // CentOS 7
+	}
+	firefoxPaths = []string{
+		"/usr/bin/firefox",
+		"/usr/bin/firefox-nightly",
+		"/usr/bin/firefox-developer-edition",
+		"/Applications/Firefox.app",
+		"/Applications/Firefox Developer Edition.app",
+		"/Applications/Firefox Nightly.app",
+		"C:\\Program Files\\Mozilla Firefox",
+	}
 )
 
 func init() {
-	for _, path := range []string{
-		"/usr/bin/firefox", nssDB, "/Applications/Firefox.app",
-		"/Applications/Firefox Developer Edition.app",
-		"C:\\Program Files\\Mozilla Firefox",
-	} {
-		_, err := os.Stat(path)
-		hasNSS = hasNSS || err == nil
+	allPaths := append(append([]string{}, nssDBs...), firefoxPaths...)
+	for _, path := range allPaths {
+		if pathExists(path) {
+			hasNSS = true
+			break
+		}
 	}
 
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := exec.Command("brew", "--prefix", "nss").Output()
-		if err != nil {
-			return
+		switch {
+		case binaryExists("certutil"):
+			certutilPath, _ = exec.LookPath("certutil")
+			hasCertutil = true
+		case binaryExists("/usr/local/opt/nss/bin/certutil"):
+			// Check the default Homebrew path, to save executing Ruby. #135
+			certutilPath = "/usr/local/opt/nss/bin/certutil"
+			hasCertutil = true
+		default:
+			out, err := exec.Command("brew", "--prefix", "nss").Output()
+			if err == nil {
+				certutilPath = filepath.Join(strings.TrimSpace(string(out)), "bin", "certutil")
+				hasCertutil = pathExists(certutilPath)
+			}
 		}
-		certutilPath = filepath.Join(strings.TrimSpace(string(out)), "bin", "certutil")
-
-		_, err = os.Stat(certutilPath)
-		hasCertutil = err == nil
 
 	case "linux":
-		var err error
-		certutilPath, err = exec.LookPath("certutil")
-		hasCertutil = err == nil
+		if hasCertutil = binaryExists("certutil"); hasCertutil {
+			certutilPath, _ = exec.LookPath("certutil")
+		}
 	}
 }
 
@@ -63,8 +87,8 @@ func (m *mkcert) checkNSS() bool {
 func (m *mkcert) installNSS() bool {
 	if m.forEachNSSProfile(func(profile string) {
 		cmd := exec.Command(certutilPath, "-A", "-d", profile, "-t", "C,,", "-n", m.caUniqueName(), "-i", filepath.Join(m.CAROOT, rootName))
-		out, err := cmd.CombinedOutput()
-		fatalIfCmdErr(err, "certutil -A", out)
+		out, err := execCertutil(cmd)
+		fatalIfCmdErr(err, "certutil -A -d "+profile, out)
 	}) == 0 {
 		log.Printf("ERROR: no %s security databases found", NSSBrowsers)
 		return false
@@ -84,29 +108,35 @@ func (m *mkcert) uninstallNSS() {
 			return
 		}
 		cmd := exec.Command(certutilPath, "-D", "-d", profile, "-n", m.caUniqueName())
-		out, err := cmd.CombinedOutput()
-		fatalIfCmdErr(err, "certutil -D", out)
+		out, err := execCertutil(cmd)
+		fatalIfCmdErr(err, "certutil -D -d "+profile, out)
 	})
+}
+
+// execCertutil will execute a "certutil" command and if needed re-execute
+// the command with commandWithSudo to work around file permissions.
+func execCertutil(cmd *exec.Cmd) ([]byte, error) {
+	out, err := cmd.CombinedOutput()
+	if err != nil && bytes.Contains(out, []byte("SEC_ERROR_READ_ONLY")) && runtime.GOOS != "windows" {
+		origArgs := cmd.Args[1:]
+		cmd = commandWithSudo(cmd.Path)
+		cmd.Args = append(cmd.Args, origArgs...)
+		out, err = cmd.CombinedOutput()
+	}
+	return out, err
 }
 
 func (m *mkcert) forEachNSSProfile(f func(profile string)) (found int) {
 	profiles, _ := filepath.Glob(FirefoxProfile)
-	if _, err := os.Stat(nssDB); err == nil {
-		profiles = append(profiles, nssDB)
-	}
-	if len(profiles) == 0 {
-		return
-	}
+	profiles = append(profiles, nssDBs...)
 	for _, profile := range profiles {
 		if stat, err := os.Stat(profile); err != nil || !stat.IsDir() {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(profile, "cert9.db")); err == nil {
+		if pathExists(filepath.Join(profile, "cert9.db")) {
 			f("sql:" + profile)
 			found++
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(profile, "cert8.db")); err == nil {
+		} else if pathExists(filepath.Join(profile, "cert8.db")) {
 			f("dbm:" + profile)
 			found++
 		}

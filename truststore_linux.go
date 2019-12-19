@@ -1,4 +1,4 @@
-// Copyright 2018 The Go Authors. All rights reserved.
+// Copyright 2018 The mkcert Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -10,21 +10,28 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
 
 var (
-	FirefoxProfile      = os.Getenv("HOME") + "/.mozilla/firefox/*"
-	CertutilInstallHelp = `apt install libnss3-tools" or "yum install nss-tools`
-	NSSBrowsers         = "Firefox and/or Chrome/Chromium"
+	FirefoxProfile = os.Getenv("HOME") + "/.mozilla/firefox/*"
+	NSSBrowsers    = "Firefox and/or Chrome/Chromium"
 
 	SystemTrustFilename string
 	SystemTrustCommand  []string
+	CertutilInstallHelp string
 )
 
 func init() {
+	switch {
+	case binaryExists("apt"):
+		CertutilInstallHelp = "apt install libnss3-tools"
+	case binaryExists("yum"):
+		CertutilInstallHelp = "yum install nss-tools"
+	case binaryExists("zypper"):
+		CertutilInstallHelp = "zypper install mozilla-nss-tools"
+	}
 	if pathExists("/etc/pki/ca-trust/source/anchors/") {
 		SystemTrustFilename = "/etc/pki/ca-trust/source/anchors/%s.pem"
 		SystemTrustCommand = []string{"update-ca-trust", "extract"}
@@ -34,18 +41,10 @@ func init() {
 	} else if pathExists("/etc/ca-certificates/trust-source/anchors/") {
 		SystemTrustFilename = "/etc/ca-certificates/trust-source/anchors/%s.crt"
 		SystemTrustCommand = []string{"trust", "extract-compat"}
+	} else if pathExists("/usr/share/pki/trust/anchors") {
+		SystemTrustFilename = "/usr/share/pki/trust/anchors/%s.pem"
+		SystemTrustCommand = []string{"update-ca-certificates"}
 	}
-	if SystemTrustCommand != nil {
-		_, err := exec.LookPath(SystemTrustCommand[0])
-		if err != nil {
-			SystemTrustCommand = nil
-		}
-	}
-}
-
-func pathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 func (m *mkcert) systemTrustFilename() string {
@@ -62,12 +61,12 @@ func (m *mkcert) installPlatform() bool {
 	cert, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
 	fatalIfErr(err, "failed to read root certificate")
 
-	cmd := CommandWithSudo("tee", m.systemTrustFilename())
+	cmd := commandWithSudo("tee", m.systemTrustFilename())
 	cmd.Stdin = bytes.NewReader(cert)
 	out, err := cmd.CombinedOutput()
 	fatalIfCmdErr(err, "tee", out)
 
-	cmd = CommandWithSudo(SystemTrustCommand...)
+	cmd = commandWithSudo(SystemTrustCommand...)
 	out, err = cmd.CombinedOutput()
 	fatalIfCmdErr(err, strings.Join(SystemTrustCommand, " "), out)
 
@@ -79,28 +78,21 @@ func (m *mkcert) uninstallPlatform() bool {
 		return false
 	}
 
-	cmd := CommandWithSudo("rm", "-f", m.systemTrustFilename())
+	cmd := commandWithSudo("rm", "-f", m.systemTrustFilename())
 	out, err := cmd.CombinedOutput()
 	fatalIfCmdErr(err, "rm", out)
 
 	// We used to install under non-unique filenames.
 	legacyFilename := fmt.Sprintf(SystemTrustFilename, "mkcert-rootCA")
 	if pathExists(legacyFilename) {
-		cmd := CommandWithSudo("rm", "-f", legacyFilename)
+		cmd := commandWithSudo("rm", "-f", legacyFilename)
 		out, err := cmd.CombinedOutput()
 		fatalIfCmdErr(err, "rm (legacy filename)", out)
 	}
 
-	cmd = CommandWithSudo(SystemTrustCommand...)
+	cmd = commandWithSudo(SystemTrustCommand...)
 	out, err = cmd.CombinedOutput()
 	fatalIfCmdErr(err, strings.Join(SystemTrustCommand, " "), out)
 
 	return true
-}
-
-func CommandWithSudo(cmd ...string) *exec.Cmd {
-	if _, err := exec.LookPath("sudo"); err != nil {
-		return exec.Command(cmd[0], cmd[1:]...)
-	}
-	return exec.Command("sudo", append([]string{"--"}, cmd...)...)
 }
